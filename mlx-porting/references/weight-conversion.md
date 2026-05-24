@@ -242,6 +242,58 @@ quantize(model, group_size=64, bits=4, class_predicate=lambda name, m: (
 ))
 ```
 
+## DWQ calibration for custom architectures (Tier 2/3)
+
+`mlx_lm.quant.dwq.dwq_quantize` distills a pre-quantized student against its bf16 teacher, recovering most of the quality lost to naive groupwise quantization. The API is callable directly on any model that exposes a `model(tokens) → logits` interface — but plugging in a custom (non-stock-mlx-lm) architecture has three sharp edges that will silently break the run.
+
+**The three traps:**
+
+1. **`model.freeze()` is required.** mlx-lm's `dwq.main()` loads via `mlx_lm.load()` which freezes the model implicitly. If you instantiate via `load_weights()` directly (any Tier 2/3 port), parameters are trainable by default. `dwq_quantize`'s `apply_to_modules(unfreeze)` is a positive filter that adds matching modules to the trainable set — it does NOT freeze non-matching modules. Without `model.freeze()` first, the optimizer trains EVERYTHING (the bf16 GEN tower, embeddings, lm_head, scales+biases). Symptom: `Trainable parameters: 49%` instead of `~2%`; validation loss diverges (gets WORSE during training); peak memory blows up 2-3×.
+
+2. **Hyperparameter defaults are very specific.** They are NOT typical fine-tuning defaults — they are tuned for *scale-and-bias calibration of QuantizedLinear*, a much narrower problem:
+
+   | Param | mlx-lm default | What goes wrong otherwise |
+   |---|---|---|
+   | Optimizer | `optimizers.Adam(learning_rate=lr, bias_correction=True)` | `AdamW` diverges immediately |
+   | Learning rate | `1e-6` | `1e-5` catastrophic; `1e-4` instantly destroys quality |
+   | num_samples | `2048` | `<128` unstable; `<64` overfits to noise |
+   | batch_size | `4` | smaller works but slow |
+   | max_seq_length | `1025` | very short truncates context |
+
+   When debugging, the smoking gun is loss going *up* monotonically (not oscillating). That's LR overshoot — drop by 10-20× and try again.
+
+3. **The model must look like a standard LLM.** For dual-tower / MoE / multimodal models (Lance, Switch-Transformer, etc.) you'll need a thin wrapper exposing `model(tokens) → logits`. mlx-lm's harness has no concept of routing, modality buckets, or position groups. For text-only DWQ on dual-tower models (UND tower of Lance, expert-1 of a MoE, etc.):
+
+   ```python
+   class TextLogitsWrapper(nn.Module):
+       def __init__(self, core_model):
+           super().__init__()
+           self.core = core_model
+           self.layers = core_model.layers  # for grad_checkpoint
+
+       def __call__(self, x):
+           B, T = x.shape
+           # All-text routing: customize per architecture
+           pos = mx.arange(T, dtype=mx.int32)
+           position_ids = mx.broadcast_to(pos[None, None, :], (3, B, T))  # 3-channel mRoPE
+           position_group = mx.zeros((T,), dtype=mx.int32)  # all TEXT bucket
+           h = self.core(input_ids=x, position_ids=position_ids,
+                         position_group=position_group)
+           return self.core.lm_head(h)
+   ```
+
+**Calibration corpus considerations:**
+
+- For dual-tower MoT models (Lance-style), text-only DWQ exercises ONE tower. The other tower (image-gen, etc.) gets no signal and naive int4 there will still produce broken outputs in the corresponding generation modality. This is fine for shipping a "UND-only" variant; for full-coverage quantization you need an architecture-aware harness that drives both towers (see Reza2kn/lance-quant for a Lance-specific AWQ implementation, ~100 LOC for the core algorithm).
+- Reza2kn's published AWQ pinning (Lance specifically): `--bits 4 --group-size 64 --num-samples 256` for DWQ; `21-point alpha grid + geomean-normalized scale fused into preceding norm` for AWQ. The naive-quant failure mode is exactly: when calibration data doesn't route through a given expert tower, that tower's `act_mean` is None, alpha-search is skipped, fallback is plain min-max int4 → gibberish.
+- **What "usable" means is prompt-dependent.** For Lance-3B-4bit-UND-DWQ specifically (validated 2026-05-23), our four-prompt sweep showed 1-of-4 reliably usable, 1-of-4 borderline, 2-of-4 unusable. The breakdown:
+  - 🟢 Single subject + texture (animal portrait) — recognizable, stylized
+  - ⚠️ Scene without subject identity (landscape) — flatter colors but recognizable
+  - ❌ Multi-element composition (dragon + castle) — model loses elements
+  - ❌ Fine in-image text (cat + "STOP" poster) — text completely lost to color smearing
+  - The UND tower's QKV at int4, even when GEN stays bf16, corrupts image generation through *shared* attention (text tokens cross-attend with latent tokens; corrupted text-side projections poison the shared SDP).
+- **Therefore: for image-generation models, UND-only DWQ at int4 ships only as "experimental, scene-only" — not as a general-purpose drop-in replacement.** Bump to int8 UND + DWQ if you need broader prompt coverage, or invest in the full-tower AWQ harness.
+
 ## Weight key renames — common patterns
 
 From past ports, these show up repeatedly. Handle in `sanitize()` (Tier 2) or `sanitize_key()` (Tier 3):

@@ -226,6 +226,44 @@ Image.fromarray((img_np * 255).astype("uint8")).save("out.png")
 
 **Rule:** When the symptom is a color-tinted or low-contrast image but layer parity passes at small scale, suspect a norm eps / fused-norm flag mismatch before suspecting attention or RoPE. Color tints almost never come from attention bugs.
 
+## 11. AutoTokenizer hangs on multimodal local paths
+
+**What goes wrong:** Quantization / calibration / DWQ scripts that need a tokenizer use `AutoTokenizer.from_pretrained(local_weights_dir)`. The call hangs indefinitely (no output, 100% CPU) with no useful error. Same path works fine for text-only models.
+
+**Cause:** When `config.json` in the local dir declares `model_type=qwen2_5_vl` (or any multimodal model_type), `AutoTokenizer` resolves the *processor pipeline* class for that model_type. For multimodal models, the processor needs image-preprocessor configs (`preprocessor_config.json`, `processor_config.json`) that aren't in our minimal converted-weights directory. The resolver retries in some stuck state instead of erroring.
+
+**Idiomatic solution:** Use `AutoProcessor.from_pretrained(hf_repo_id).tokenizer` instead — same path the production inference pipelines use. The HF repo has the full processor config; it's cached after first download.
+
+```python
+# ❌ Hangs forever on multimodal local paths
+tokenizer = AutoTokenizer.from_pretrained("/path/to/local/qwen2_5_vl_weights")
+
+# ✅ Always works (cached after first download)
+from transformers import AutoProcessor
+processor = AutoProcessor.from_pretrained("Qwen/Qwen2.5-VL-3B-Instruct")
+tokenizer = processor.tokenizer
+```
+
+**Tokenizer length surprises (Qwen BPE):** related tokenization gotcha — Qwen's BPE is more compact than typical English-trained tokenizers. Median typical-sentence token count ≈ 25, max ≈ 35. Calibration-set filters of `len(tokens) >= 32` that work for older tokenizers will reject ~95% of lines and infinite-loop typical corpora. Use `>= 8` and let downstream batchers pad.
+
+## 12. Background `uv run` commands need explicit `cd`
+
+**What goes wrong:** `Bash` tool's `run_in_background` (and similar harness-managed background commands) can have cwd reset to a default project root that is NOT your MLX port's repo. Without explicit `cd`, `uv run python script.py` resolves dependencies against the *wrong* `pyproject.toml`. With no installed `mlx` in that venv, uv attempts to install/sync — and can hang for hours at 100% CPU producing zero output.
+
+**Symptom:** Background MLX command shows 100% CPU, ~600MB RAM, no log lines for tens of minutes. Looks identical to a Python import hang but is actually a `uv sync` deadlock against the wrong project.
+
+**Idiomatic solution:** Always prepend `cd /absolute/path/to/your/repo &&` to backgrounded `uv run` / `python -m` commands in harness contexts. Foreground commands inherit the harness cwd correctly; background commands don't.
+
+```bash
+# ❌ Hangs at 100% CPU forever in some harness contexts
+uv run python scripts/my_script.py
+
+# ✅ Always works
+cd /Volumes/.../my-mlx-repo && uv run python scripts/my_script.py
+```
+
+This is harness-specific (Claude Code, codex, etc.) and only bites on `run_in_background=true`. If you see CPU spinning with no output where you'd normally see progress, suspect this before suspecting model imports.
+
 ## Reading strategy
 
 When reading PyTorch source before porting, open three files side-by-side:
